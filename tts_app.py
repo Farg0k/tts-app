@@ -55,8 +55,11 @@ print("Всі моделі завантажено.")
 
 
 # --- УТИЛІТИ ---
-
+ACCENT_MASK_RE = r'\{\{ACCENT_MASK_\d+\}\}'
 SILENCE_RE = r'\{\{SILENCE_\d+(?:_\d+)?\}\}'
+VOICE_TAG_RE = r'\{\{VOICE:([^}]+)\}\}(.*?)\{\{/VOICE\}\}'
+VOICE_PAUSE_SAMPLES = int(0.5 * 24000)  # 0.5 сек після {{/VOICE}}
+
 
 def split_to_parts(text, group=True):
     text = re.sub(r'(\w+[^.,!:?\-])\n', r'\1. ', text)
@@ -76,18 +79,130 @@ def split_to_parts(text, group=True):
 
 
 def verbalize(text):
-    # Розбиваємо по {{SILENCE_X_Y}}, вербалізуємо тільки текстові частини, складаємо назад
-    segments = re.split(f'({SILENCE_RE})', text)
+    pattern = f'({VOICE_TAG_RE}|{SILENCE_RE}|{ACCENT_MASK_RE})'
+    segments = re.split(pattern, text, flags=re.DOTALL)
     result = ''
-    for seg in segments:
-        if re.fullmatch(SILENCE_RE, seg):
-            result += seg + ' '
-        else:
-            parts = split_to_parts(seg, group=False)
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if not seg:
+            i += 1
+            continue
+        if re.fullmatch(SILENCE_RE, seg.strip()):
+            result += seg.strip() + ' '
+            i += 1
+            continue
+        if re.fullmatch(ACCENT_MASK_RE, seg.strip()):
+            result += seg.strip() + ' '
+            i += 1
+            continue
+        voice_match = re.fullmatch(VOICE_TAG_RE, seg.strip(), flags=re.DOTALL)
+        if voice_match:
+            voice_name = voice_match.group(1)
+            inner_text = voice_match.group(2)
+            parts = split_to_parts(inner_text, group=False)
+            verbalized_inner = ''
             for part in parts:
                 if part.strip():
-                    result += verbalizer.process_text(part.strip())[0] + ' '
+                    verbalized_inner += verbalizer.process_text(part.strip())[0] + ' '
+            result += f'{{{{VOICE:{voice_name}}}}}{verbalized_inner.strip()}{{{{/VOICE}}}} '
+            i += 1
+            continue
+        parts = split_to_parts(seg, group=False)
+        for part in parts:
+            if part.strip():
+                result += verbalizer.process_text(part.strip())[0] + ' '
+        i += 1
     return result.strip()
+
+
+def parse_segments(text, narrator_voice, styles_dict):
+    """
+    Розбиває текст на сегменти: [(текст, голос, додати_паузу_після)]
+    - Текст без тегів → голос оповідача
+    - {{VOICE:name}}...{{/VOICE}} → голос name, після — пауза 0.5с
+    - {{SILENCE_X}} → None (спеціальний тег тиші)
+    """
+    segments = []
+    remaining = text
+
+    # Регулярка для пошуку VOICE тегів і SILENCE тегів
+    combined_re = re.compile(
+        r'(\{\{VOICE:([^}]+)\}\}(.*?)\{\{/VOICE\}\})|(\{\{SILENCE_(\d+)(?:_(\d+))?\}\})',
+        re.DOTALL
+    )
+
+    last_end = 0
+    for m in combined_re.finditer(remaining):
+        # Текст до матчу — оповідач
+        before = remaining[last_end:m.start()].strip()
+        if before:
+            for part in split_to_parts(before):
+                if part.strip():
+                    segments.append(('text', part.strip(), narrator_voice, False))
+
+        if m.group(1):  # VOICE тег
+            voice_name = m.group(2).strip()
+            inner = m.group(3).strip()
+            # Перевіряємо чи є такий голос, інакше fallback на оповідача
+            if voice_name not in styles_dict:
+                print(f"⚠️ Голос '{voice_name}' не знайдено, використовую оповідача")
+                voice_name = narrator_voice
+            for part in split_to_parts(inner):
+                if part.strip():
+                    segments.append(('text', part.strip(), voice_name, False))
+            # Пауза після {{/VOICE}}
+            #segments.append(('pause', None, None, False))
+
+        elif m.group(4):  # SILENCE тег
+            int_part = m.group(5)
+            frac_part = m.group(6)
+            duration = float(f'{int_part}.{frac_part}' if frac_part else int_part)
+            segments.append(('silence', duration, None, False))
+
+        last_end = m.end()
+
+    # Залишок тексту після останнього тегу
+    after = remaining[last_end:].strip()
+    if after:
+        for part in split_to_parts(after):
+            if part.strip():
+                segments.append(('text', part.strip(), narrator_voice, False))
+
+    return segments
+
+
+def synthesize_text_part(model_obj, model_name, text, style, speed, device):
+    """Синтезує один текстовий сегмент, повертає список wav тензорів."""
+    result = []
+    t = text.strip().replace('"', '')
+    if not t:
+        return result
+
+    t = t.replace('+', StressSymbol.CombiningAcuteAccent)
+    t = normalize('NFKC', t)
+    t = re.sub(r'[᠆‐‑‒–—―⁻₋−⸺⸻]', '-', t)
+
+    if not re.search(r'\w', t):
+        return result
+
+    if t[-1] not in '.?!:-':
+        t += '.'
+
+    t = re.sub(r' - ', ': ', t)
+    t = stressify(t)
+    ps = ipa(t)
+    if not ps:
+        return result
+
+    tokens = model_obj.tokenizer.encode(ps)
+    chunks = [tokens[i:i + 480] for i in range(0, len(tokens), 480)]
+
+    for tok_chunk in chunks:
+        wav = model_obj(tok_chunk, speed=speed, s_prev=style)
+        result.append(wav)
+
+    return result
 
 
 def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress()):
@@ -95,6 +210,7 @@ def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress())
         raise gr.Error("Введіть текст")
 
     start_time = time.time()
+    sample_rate = 24000
 
     if model_name == 'multi':
         model_obj = multi_model
@@ -107,56 +223,56 @@ def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress())
         styles_dict = None
 
     result_wav = []
-    sample_rate = 24000
 
-    # Спочатку ділимо по тегах {{SILENCE_X_Y}}, зберігаючи самі теги
-    raw_segments = re.split(f'({SILENCE_RE})', text)
-
-    # Кожен сегмент або тег тиші, або звичайний текст який треба ще розбити
-    segments = []
-    for seg in raw_segments:
-        if re.fullmatch(SILENCE_RE, seg.strip()):
-            segments.append(seg.strip())
-        else:
-            parts = split_to_parts(seg)
-            segments.extend(parts)
-
-    for t in progress.tqdm(segments):
-        t = t.strip().replace('"', '')
-        if not t:
-            continue
-
-        # --- ТИША ---
-        silence_match = re.fullmatch(r'\{\{SILENCE_(\d+)(?:_(\d+))?\}\}', t)
-        if silence_match:
-            # {{SILENCE_2}} → 2с, {{SILENCE_1_5}} → 1.5с
-            int_part = silence_match.group(1)
-            frac_part = silence_match.group(2)
-            duration = float(f'{int_part}.{frac_part}' if frac_part else int_part)
-            result_wav.append(torch.zeros(int(duration * sample_rate), device=device))
-            continue
-
-        # --- ОБРОБКА ТЕКСТУ ---
-        t = t.replace('+', StressSymbol.CombiningAcuteAccent)
-        t = normalize('NFKC', t)
-        t = re.sub(r'[᠆‐‑‒–—―⁻₋−⸺⸻]', '-', t)
-
-        # Пропускаємо якщо немає літер
-        if not re.search(r'\w', t):
-            continue
-
-        if t[-1] not in '.?!:-':
-            t += '.'
-
-        ps = ipa(stressify(t))
-        if ps:
-            tokens = model_obj.tokenizer.encode(ps)
-            if model_name == 'single':
-                style = single_style
+    # Single speaker — без підтримки VOICE тегів
+    if model_name == 'single':
+        raw_segments = re.split(f'({SILENCE_RE})', text)
+        segments_flat = []
+        for seg in raw_segments:
+            if re.fullmatch(SILENCE_RE, seg.strip()):
+                segments_flat.append(seg.strip())
             else:
-                style = styles_dict[voice_name] if voice_name and voice_name in styles_dict else list(styles_dict.values())[0]
-            wav = model_obj(tokens, speed=speed, s_prev=style)
-            result_wav.append(wav)
+                segments_flat.extend(split_to_parts(seg))
+
+        for t in progress.tqdm(segments_flat):
+            t = t.strip().replace('"', '')
+            if not t:
+                continue
+            silence_match = re.fullmatch(r'\{\{SILENCE_(\d+)(?:_(\d+))?\}\}', t)
+            if silence_match:
+                int_part = silence_match.group(1)
+                frac_part = silence_match.group(2)
+                duration = float(f'{int_part}.{frac_part}' if frac_part else int_part)
+                result_wav.append(torch.zeros(int(duration * sample_rate), device=device))
+                continue
+            wavs = synthesize_text_part(model_obj, model_name, t, single_style, speed, device)
+            result_wav.extend(wavs)
+
+    else:
+        # Multi speaker — підтримка {{VOICE:name}} тегів
+        narrator_style = styles_dict.get(voice_name, list(styles_dict.values())[0])
+
+        segments = parse_segments(text, voice_name, styles_dict)
+
+        for seg in progress.tqdm(segments):
+            seg_type = seg[0]
+
+            if seg_type == 'silence':
+                duration = seg[1]
+                result_wav.append(torch.zeros(int(duration * sample_rate), device=device))
+
+            elif seg_type == 'pause':
+                # Автоматична пауза 0.5с після {{/VOICE}}
+                result_wav.append(torch.zeros(VOICE_PAUSE_SAMPLES, device=device))
+
+            elif seg_type == 'text':
+                _, part_text, part_voice, _ = seg
+                style = styles_dict.get(part_voice, narrator_style)
+                wavs = synthesize_text_part(model_obj, model_name, part_text, style, speed, device)
+                result_wav.extend(wavs)
+
+    if not result_wav:
+        raise gr.Error("Не вдалося синтезувати аудіо")
 
     final_wav = torch.concatenate(result_wav).cpu().numpy()
     final_wav = (final_wav * 32767).clip(-32768, 32767).astype('int16')
@@ -172,13 +288,21 @@ if __name__ == "__main__":
     with gr.Blocks(title="StyleTTS2 ukrainian") as demo:
         gr.Markdown("# StyleTTS2 Ukrainian Local")
 
+        voice_hint = (
+            "**Підтримка кількох голосів:** оберіть голос оповідача нижче. "
+            "Для інших персонажів використовуйте теги у тексті:\n"
+            "`{{VOICE:ім'я_голосу}} текст персонажа {{/VOICE}}`\n"
+            "Після кожного `{{/VOICE}}` автоматично додається пауза 0.5с."
+        )
+
         with gr.Tab("Multi speaker (HiFiGAN)"):
+            gr.Markdown(voice_hint)
             with gr.Row():
                 with gr.Column():
                     input_m = gr.Text(label='Текст', lines=5)
                     btn_v_m = gr.Button("Вербалізувати")
                     speed_m = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
-                    speaker_m = gr.Dropdown(choices=multi_prompts_list, value=multi_prompts_list[0], label="Голос")
+                    speaker_m = gr.Dropdown(choices=multi_prompts_list, value=multi_prompts_list[0], label="Голос оповідача")
                 with gr.Column():
                     out_m = gr.Audio(label="Аудіо")
                     stats_m = gr.Markdown("...")
@@ -191,13 +315,13 @@ if __name__ == "__main__":
             )
 
         with gr.Tab("Multi speaker (iSTFTNet)"):
-            gr.Markdown("*Швидший вокодер — менше часу на синтез*")
+            gr.Markdown("*Швидший вокодер — менше часу на синтез*\n\n" + voice_hint)
             with gr.Row():
                 with gr.Column():
                     input_i = gr.Text(label='Текст', lines=5)
                     btn_v_i = gr.Button("Вербалізувати")
                     speed_i = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
-                    speaker_i = gr.Dropdown(choices=istft_prompts_list, value=istft_prompts_list[0], label="Голос")
+                    speaker_i = gr.Dropdown(choices=istft_prompts_list, value=istft_prompts_list[0], label="Голос оповідача")
                 with gr.Column():
                     out_i = gr.Audio(label="Аудіо")
                     stats_i = gr.Markdown("...")
