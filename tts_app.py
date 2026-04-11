@@ -14,20 +14,35 @@ from ukrainian_word_stress import Stressifier, StressSymbol
 stressify = Stressifier()
 #device = 'cpu'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Пристрій: {device.upper()}")
+if device == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU RAM: {torch.cuda.get_device_properties(0).total_memory / 1024**2:.0f} MB total")
 verbalizer = Verbalizer()
 
-# --- ЗАВАНТАЖЕННЯ МОДЕЛЕЙ ---
-print("Завантаження моделей...")
+# --- ЛІНИВЕ ЗАВАНТАЖЕННЯ МОДЕЛЕЙ ---
+_models = {}
 
-# Single speaker
-single_model = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_single', device=device)
-single_style = torch.load('filatov.pt', map_location=device)
-
-# Multi speaker (HiFiGAN)
-multi_model = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker', device=device)
-
-# Multi speaker (iSTFTNet) — швидший вокодер
-istft_model = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker_istftnet', device=device)
+def get_model(model_name):
+    if model_name not in _models:
+        print(f"Завантаження моделі {model_name}...")
+        if model_name == 'single':
+            _models['single'] = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_single', device=device)
+            _models['single_style'] = torch.load('filatov.pt', map_location=device)
+        elif model_name == 'multi':
+            _models['multi'] = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker', device=device)
+        elif model_name == 'istft':
+            _models['istft'] = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker_istftnet', device=device)
+        print(f"Модель {model_name} завантажено.")
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**2
+            reserved = torch.cuda.memory_reserved() / 1024**2
+            print(f"GPU RAM: {allocated:.0f} MB allocated / {reserved:.0f} MB reserved")
+        else:
+            import psutil
+            ram = psutil.virtual_memory()
+            print(f"CPU RAM: {ram.used / 1024**2:.0f} MB used / {ram.total / 1024**2:.0f} MB total")
+    return _models[model_name]
 
 # --- ПАПКИ З ГОЛОСАМИ ---
 multi_prompts_dir = 'voices'
@@ -94,40 +109,51 @@ def split_to_parts(text, group=True):
 
 
 def verbalize(text):
-    pattern = f'({VOICE_TAG_RE}|{SILENCE_RE}|{ACCENT_MASK_RE})'
-    segments = re.split(pattern, text, flags=re.DOTALL)
+    combined_re = re.compile(
+        rf'(?:{VOICE_TAG_RE}|{SILENCE_RE}|{ACCENT_MASK_RE})',
+        re.DOTALL
+    )
+    # Використовуємо окремий патерн з групами для розпізнавання типу тегу
+    voice_re = re.compile(rf'^{VOICE_TAG_RE}$', re.DOTALL)
+
     result = ''
-    i = 0
-    while i < len(segments):
-        seg = segments[i]
-        if not seg:
-            i += 1
-            continue
-        if re.fullmatch(SILENCE_RE, seg.strip()):
-            result += seg.strip() + ' '
-            i += 1
-            continue
-        if re.fullmatch(ACCENT_MASK_RE, seg.strip()):
-            result += seg.strip() + ' '
-            i += 1
-            continue
-        voice_match = re.fullmatch(VOICE_TAG_RE, seg.strip(), flags=re.DOTALL)
-        if voice_match:
-            voice_name = voice_match.group(1)
-            inner_text = voice_match.group(2)
-            parts = split_to_parts(inner_text, group=False)
-            verbalized_inner = ''
+    last_end = 0
+
+    for m in combined_re.finditer(text):
+        before = text[last_end:m.start()]
+        if before.strip():
+            parts = split_to_parts(before, group=False)
             for part in parts:
                 if part.strip():
-                    verbalized_inner += verbalizer.process_text(part.strip().lower())[0] + ' '
-            result += f'{{{{VOICE:{voice_name}}}}}{verbalized_inner.strip()}{{{{/VOICE}}}} '
-            i += 1
-            continue
-        parts = split_to_parts(seg, group=False)
+                    result += verbalizer.process_text(part.strip().lower())[0] + ' '
+
+        matched = m.group(0)
+
+        if re.fullmatch(SILENCE_RE, matched):
+            result += matched + ' '
+        elif re.fullmatch(ACCENT_MASK_RE, matched):
+            result += matched + ' '
+        else:
+            vm = voice_re.fullmatch(matched)
+            if vm:
+                voice_name = vm.group(1)
+                inner_text = vm.group(2)
+                parts = split_to_parts(inner_text, group=False)
+                verbalized_inner = ''
+                for part in parts:
+                    if part.strip():
+                        verbalized_inner += verbalizer.process_text(part.strip().lower())[0] + ' '
+                result += f'{{{{VOICE:{voice_name}}}}}{verbalized_inner.strip()}{{{{/VOICE}}}} '
+
+        last_end = m.end()
+
+    after = text[last_end:]
+    if after.strip():
+        parts = split_to_parts(after, group=False)
         for part in parts:
             if part.strip():
                 result += verbalizer.process_text(part.strip().lower())[0] + ' '
-        i += 1
+
     return result.strip()
 
 
@@ -228,13 +254,13 @@ def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress())
     sample_rate = 24000
 
     if model_name == 'multi':
-        model_obj = multi_model
+        model_obj = get_model('multi')
         styles_dict = multi_styles
     elif model_name == 'istft':
-        model_obj = istft_model
+        model_obj = get_model('istft')
         styles_dict = istft_styles
     else:
-        model_obj = single_model
+        model_obj = get_model('single')
         styles_dict = None
 
     result_wav = []
@@ -260,7 +286,7 @@ def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress())
                 duration = float(f'{int_part}.{frac_part}' if frac_part else int_part)
                 result_wav.append(torch.zeros(int(duration * sample_rate), device=device))
                 continue
-            wavs = synthesize_text_part(model_obj, model_name, t, single_style, speed, device)
+            wavs = synthesize_text_part(model_obj, model_name, t, _models['single_style'], speed, device)
             result_wav.extend(wavs)
 
     else:
@@ -309,9 +335,9 @@ def create_voice(input_audio, voice_name, model_name):
     voice_name = voice_name.strip()
 
     if model_name == 'multi':
-        model_obj = multi_model
+        model_obj = get_model('multi')
     else:
-        model_obj = istft_model
+        model_obj = get_model('istft')
 
     out_dir = 'voices'
     os.makedirs(out_dir, exist_ok=True)
