@@ -29,29 +29,44 @@ multi_model = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker', de
 # Multi speaker (iSTFTNet) — швидший вокодер
 istft_model = StyleTTS2(hf_path='patriotyk/styletts2_ukrainian_multispeaker_istftnet', device=device)
 
-# --- ГОЛОСИ ДЛЯ MULTI (HiFiGAN) ---
+# --- ПАПКИ З ГОЛОСАМИ ---
 multi_prompts_dir = 'voices'
-multi_audio_files = sorted(glob.glob(os.path.join(multi_prompts_dir, '*.pt')))
-multi_prompts_list = [os.path.basename(f).replace('.pt', '') for f in multi_audio_files]
-multi_styles = {}
-for audio_path in multi_audio_files:
-    name = os.path.basename(audio_path).replace('.pt', '')
-    multi_styles[name] = torch.load(audio_path, map_location=device)
-    print('Завантажено (multi):', name)
-
-# --- ГОЛОСИ ДЛЯ ISTFT ---
-# Якщо є окрема папка voices_istft — використовуємо її,
-# інакше використовуємо ті самі голоси що й для multi
 istft_prompts_dir = 'voices_istft' if os.path.isdir('voices_istft') else 'voices'
-istft_audio_files = sorted(glob.glob(os.path.join(istft_prompts_dir, '*.pt')))
-istft_prompts_list = [os.path.basename(f).replace('.pt', '') for f in istft_audio_files]
-istft_styles = {}
-for audio_path in istft_audio_files:
-    name = os.path.basename(audio_path).replace('.pt', '')
-    istft_styles[name] = torch.load(audio_path, map_location=device)
-    print('Завантажено (istft):', name)
+
+
+# --- ФУНКЦІЯ ЗАВАНТАЖЕННЯ ГОЛОСІВ ---
+def load_voices(prompts_dir, model_device):
+    audio_files = sorted(glob.glob(os.path.join(prompts_dir, '*.pt')))
+    prompts_list = [os.path.basename(f).replace('.pt', '') for f in audio_files]
+    styles = {}
+    for audio_path in audio_files:
+        name = os.path.basename(audio_path).replace('.pt', '')
+        styles[name] = torch.load(audio_path, map_location=model_device)
+        #print('Завантажено:', name)
+    return prompts_list, styles
+
+
+# --- ПОЧАТКОВЕ ЗАВАНТАЖЕННЯ ГОЛОСІВ ---
+multi_prompts_list, multi_styles = load_voices(multi_prompts_dir, device)
+istft_prompts_list, istft_styles = load_voices(istft_prompts_dir, device)
 
 print("Всі моделі завантажено.")
+
+
+# --- ФУНКЦІЯ ОНОВЛЕННЯ ГОЛОСІВ ---
+def refresh_voices():
+    global multi_styles, multi_prompts_list, istft_styles, istft_prompts_list
+    print("Оновлення списку голосів...")
+    multi_prompts_list, multi_styles = load_voices(multi_prompts_dir, device)
+    istft_prompts_list, istft_styles = load_voices(istft_prompts_dir, device)
+    first_m = multi_prompts_list[0] if multi_prompts_list else None
+    first_i = istft_prompts_list[0] if istft_prompts_list else None
+    print(f"Оновлено: multi={len(multi_prompts_list)} голосів, istft={len(istft_prompts_list)} голосів")
+    return (
+        gr.Dropdown(choices=multi_prompts_list, value=first_m),
+        gr.Dropdown(choices=istft_prompts_list, value=first_i),
+        f"✅ Оновлено: **multi** — {len(multi_prompts_list)} голосів, **istft** — {len(istft_prompts_list)} голосів"
+    )
 
 
 # --- УТИЛІТИ ---
@@ -104,14 +119,14 @@ def verbalize(text):
             verbalized_inner = ''
             for part in parts:
                 if part.strip():
-                    verbalized_inner += verbalizer.process_text(part.strip())[0] + ' '
+                    verbalized_inner += verbalizer.process_text(part.strip().lower())[0] + ' '
             result += f'{{{{VOICE:{voice_name}}}}}{verbalized_inner.strip()}{{{{/VOICE}}}} '
             i += 1
             continue
         parts = split_to_parts(seg, group=False)
         for part in parts:
             if part.strip():
-                result += verbalizer.process_text(part.strip())[0] + ' '
+                result += verbalizer.process_text(part.strip().lower())[0] + ' '
         i += 1
     return result.strip()
 
@@ -284,6 +299,35 @@ def synthesize(model_name, text, speed, voice_name=None, progress=gr.Progress())
 
 
 # --- ЗАПУСК ---
+# --- СТВОРЕННЯ НОВОГО ГОЛОСУ ---
+def create_voice(input_audio, voice_name, model_name):
+    if input_audio is None:
+        raise gr.Error("Завантажте аудіо файл")
+    if not voice_name.strip():
+        raise gr.Error("Введіть ім'я голосу")
+
+    voice_name = voice_name.strip()
+
+    if model_name == 'multi':
+        model_obj = multi_model
+    else:
+        model_obj = istft_model
+
+    out_dir = 'voices'
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, f"{voice_name}.pt")
+
+    if os.path.exists(output_path):
+        raise gr.Error(f"Голос '{voice_name}' вже існує. Оберіть інше ім'я.")
+
+    print(f"--- Генерація вектора стилю з: {input_audio} ---")
+    style = model_obj.extract_voice_features(input_audio)
+    torch.save(style, output_path)
+    print(f"✅ Збережено: {output_path}")
+
+    return f"✅ Голос **{voice_name}** збережено до `{output_path}` (форма: {style.shape})"
+
+
 if __name__ == "__main__":
     with gr.Blocks(title="StyleTTS2 ukrainian") as demo:
         gr.Markdown("# StyleTTS2 Ukrainian Local")
@@ -295,25 +339,30 @@ if __name__ == "__main__":
             "Після кожного `{{/VOICE}}` автоматично додається пауза 0.5с."
         )
 
-        with gr.Tab("Multi speaker (HiFiGAN)"):
-            gr.Markdown(voice_hint)
+        # --- Кнопка оновлення голосів (глобальна) ---
+        with gr.Row():
+            btn_refresh = gr.Button("🔄 Оновити список голосів", variant="secondary")
+            refresh_status = gr.Markdown("")
+
+        # --- Вкладка 1: Single speaker ---
+        with gr.Tab("Single speaker"):
             with gr.Row():
                 with gr.Column():
-                    input_m = gr.Text(label='Текст', lines=5)
-                    btn_v_m = gr.Button("Вербалізувати")
-                    speed_m = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
-                    speaker_m = gr.Dropdown(choices=multi_prompts_list, value=multi_prompts_list[0], label="Голос оповідача")
+                    input_s = gr.Text(label='Текст', lines=5)
+                    btn_v_s = gr.Button("Вербалізувати")
+                    speed_s = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
                 with gr.Column():
-                    out_m = gr.Audio(label="Аудіо")
-                    stats_m = gr.Markdown("...")
-                    btn_m = gr.Button("Синтезувати")
-            btn_v_m.click(verbalize, inputs=[input_m], outputs=[input_m])
-            btn_m.click(
+                    out_s = gr.Audio(label="Аудіо")
+                    stats_s = gr.Markdown("...")
+                    btn_s = gr.Button("Синтезувати")
+            btn_v_s.click(verbalize, inputs=[input_s], outputs=[input_s])
+            btn_s.click(
                 synthesize,
-                inputs=[gr.Text(value='multi', visible=False), input_m, speed_m, speaker_m],
-                outputs=[out_m, stats_m]
+                inputs=[gr.Text(value='single', visible=False), input_s, speed_s],
+                outputs=[out_s, stats_s]
             )
 
+        # --- Вкладка 2: Multi speaker (iSTFTNet) ---
         with gr.Tab("Multi speaker (iSTFTNet)"):
             gr.Markdown("*Швидший вокодер — менше часу на синтез*\n\n" + voice_hint)
             with gr.Row():
@@ -333,28 +382,74 @@ if __name__ == "__main__":
                 outputs=[out_i, stats_i]
             )
 
-        with gr.Tab("Single speaker"):
+        # --- Вкладка 3: Multi speaker (HiFiGAN) ---
+        with gr.Tab("Multi speaker (HiFiGAN)"):
+            gr.Markdown(voice_hint)
             with gr.Row():
                 with gr.Column():
-                    input_s = gr.Text(label='Текст', lines=5)
-                    btn_v_s = gr.Button("Вербалізувати")
-                    speed_s = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
+                    input_m = gr.Text(label='Текст', lines=5)
+                    btn_v_m = gr.Button("Вербалізувати")
+                    speed_m = gr.Slider(0.7, 1.3, 1.0, label='Швидкість')
+                    speaker_m = gr.Dropdown(choices=multi_prompts_list, value=multi_prompts_list[0], label="Голос оповідача")
                 with gr.Column():
-                    out_s = gr.Audio(label="Аудіо")
-                    stats_s = gr.Markdown("...")
-                    btn_s = gr.Button("Синтезувати")
-            btn_v_s.click(verbalize, inputs=[input_s], outputs=[input_s])
-            btn_s.click(
+                    out_m = gr.Audio(label="Аудіо")
+                    stats_m = gr.Markdown("...")
+                    btn_m = gr.Button("Синтезувати")
+            btn_v_m.click(verbalize, inputs=[input_m], outputs=[input_m])
+            btn_m.click(
                 synthesize,
-                inputs=[gr.Text(value='single', visible=False), input_s, speed_s],
-                outputs=[out_s, stats_s]
+                inputs=[gr.Text(value='multi', visible=False), input_m, speed_m, speaker_m],
+                outputs=[out_m, stats_m]
             )
 
+        # --- Вкладка 4: Додати голос ---
+        with gr.Tab("➕ Додати голос"):
+            gr.Markdown(
+                "Завантажте аудіо запис голосу (wav, mp3, flac, ogg), "
+                "вкажіть ім'я і натисніть **Створити**. "
+                "Список голосів оновиться автоматично."
+            )
+            with gr.Row():
+                with gr.Column():
+                    audio_input = gr.Audio(label="Аудіо файл", type="filepath")
+                    new_voice_name = gr.Text(label="Ім'я голосу (без пробілів)")
+                    voice_model_choice = gr.Dropdown(
+                        choices=["multi", "istft"],
+                        value="istft",
+                        label="Модель"
+                    )
+                    btn_create_voice = gr.Button("🎤 Створити голос", variant="primary")
+                with gr.Column():
+                    create_voice_status = gr.Markdown("")
+
+        # --- Підключення кнопки оновлення голосів ---
+        btn_refresh.click(
+            fn=refresh_voices,
+            inputs=[],
+            outputs=[speaker_m, speaker_i, refresh_status]
+        )
+
+        # --- Після створення голосу — автоматично оновити списки ---
+        def create_voice_and_refresh(input_audio, voice_name, model_name):
+            status = create_voice(input_audio, voice_name, model_name)
+            dropdown_m, dropdown_i, _ = refresh_voices()
+            return status, dropdown_m, dropdown_i
+
+        btn_create_voice.click(
+            fn=create_voice_and_refresh,
+            inputs=[audio_input, new_voice_name, voice_model_choice],
+            outputs=[create_voice_status, speaker_m, speaker_i]
+        )
+
         # --- API ендпоінти ---
-        # POST http://127.0.0.1:7860/api/voices     → {"voices": [...]}
+        # POST http://127.0.0.1:7860/api/voices     → {"voices": [...]}  (також оновлює список голосів)
         # POST http://127.0.0.1:7860/api/verbalize  → вербалізований текст
+        def api_voices():
+            dropdown_m, dropdown_i, _ = refresh_voices()
+            return {"voices": multi_prompts_list}
+
         voices_out = gr.JSON(visible=False)
-        gr.Button(visible=False).click(fn=lambda: {"voices": multi_prompts_list}, inputs=[], outputs=voices_out, api_name="voices")
+        gr.Button(visible=False).click(fn=api_voices, inputs=[], outputs=voices_out, api_name="voices")
 
         verbalize_in = gr.Text(visible=False)
         verbalize_out = gr.Text(visible=False)
